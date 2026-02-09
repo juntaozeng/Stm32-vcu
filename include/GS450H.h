@@ -31,6 +31,7 @@
 #include "digio.h"
 #include "params.h"
 #include "inverter.h"
+#include "ice_state.h"
 
 #define MG2MAXSPEED 10000
 #define MAX_COMMAND_SIZE 200
@@ -43,17 +44,21 @@ public:
    {
        scaledTorqueTarget = 0;
        timerIsRunning = false;
+       sunTeeth = 34;
+       ringTeeth = 78;
    }
    void Task1Ms();
+   void Task10Ms();
    void Task100Ms();
    void SetTorque(float torquePercent);
    float GetMotorTemperature();
    float GetInverterTemperature() { return temp_inv_water; }
    float GetInverterVoltage() { return dc_bus_voltage; }
    float GetMotorSpeed() { return mg2_speed; }
+   int16_t GetMG1Speed() { return mg1_speed; }
+   int16_t GetMG2Speed() { return mg2_speed; }
    int GetInverterState();
-   void DeInit() { setTimerState(false); } //called when switching to another inverter, similar to a destructor
-
+   void DeInit() { setTimerState(false); iceState.RequestStop(); }
 
    //Lexus/Toyota specific functions
    void SetPrius();
@@ -62,16 +67,25 @@ public:
    void SetGear(int16_t g) { gear = g; }
    void SetOil(int16_t o) { oil = o; }
 
+   ICEState* GetICEState() { return &iceState; }
+
 private:
    int16_t dc_bus_voltage, mg1_speed, mg2_speed, gear, oil;
    float temp_inv_water, temp_inv_inductor;
    bool timerIsRunning;
    int scaledTorqueTarget;
+   uint8_t sunTeeth, ringTeeth;
+   ICEState iceState;
+
    uint8_t VerifyMTHChecksum(uint16_t );
    void CalcHTMChecksum(uint16_t);
    void setTimerState(bool);
    void GS450Hgear();
    void GS450Houtput();
+   void SetTorqueHybrid(float torquePercent);
+   int16_t CalcICE_RPM();
+   void CrankICE();
+   void EnforceMG1SpeedLimit();
 };
 
 #endif /* GS450H_h */

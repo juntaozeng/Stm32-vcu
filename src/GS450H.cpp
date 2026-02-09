@@ -25,6 +25,7 @@
 #include "anain.h"
 #include "my_math.h"
 #include "utils.h"
+#include "param_prj.h"
 
 #define  LOW_Gear  0
 #define  HIGH_Gear  1
@@ -99,6 +100,15 @@ uint8_t  htm_data_Init_GS300H[6][105]=
 
 void GS450HClass::SetTorque(float torquePercent)
 {
+    int driveMode = Param::GetInt(Param::DriveMode);
+
+    // If not in EV-only mode, delegate to hybrid torque logic
+    if (driveMode != DRV_EV_ONLY)
+    {
+        SetTorqueHybrid(torquePercent);
+        return;
+    }
+
     uint8_t MotorActive = Param::GetInt(Param::MotActive);
     if(DriveType == GS450H)
     {
@@ -363,6 +373,8 @@ void GS450HClass::SetPrius()
     }
     for(int i=0; i<100; i++)htm_data[i] = htm_data_Prius[i];
     DriveType = PRIUS;
+    sunTeeth = 30;
+    ringTeeth = 78;
 }
 
 void GS450HClass::SetGS450H()
@@ -374,6 +386,8 @@ void GS450HClass::SetGS450H()
         inv_status = 1;//must be 1 for gs450h
     }
     DriveType = GS450H;
+    sunTeeth = 34;
+    ringTeeth = 78;
 }
 
 void GS450HClass::SetGS300H()
@@ -387,6 +401,8 @@ void GS450HClass::SetGS300H()
     inv_status = 0;//must be 0 for gs300h
     for(int i=0; i<105; i++)htm_data[i] = htm_data_GS300H[i];
     DriveType = IS300H;
+    sunTeeth = 34; // GS300H uses similar planetary to GS450H
+    ringTeeth = 78;
 }
 
 uint8_t GS450HClass::VerifyMTHChecksum(uint16_t len)
@@ -790,6 +806,215 @@ int GS450HClass::GetInverterState()
 {
     return statusInv;
 }
+
+//////////////////////////////////////////////////////////////
+// Hybrid mode support
+//////////////////////////////////////////////////////////////
+
+void GS450HClass::Task10Ms()
+{
+    int driveMode = Param::GetInt(Param::DriveMode);
+
+    // Update ICE state machine
+    iceState.Task10Ms();
+
+    // Provide MG1 speed feedback for ICE detection
+    float planetaryRatio = (float)ringTeeth / (float)sunTeeth;
+    iceState.SetMG1SpeedFeedback(mg1_speed, mg2_speed, planetaryRatio);
+
+    // Calculate and publish ICE RPM from planetary equation:
+    // ICE_RPM = (Sun * MG1_RPM + Ring * MG2_RPM) / (Sun + Ring)
+    int16_t iceRPM = CalcICE_RPM();
+    Param::SetInt(Param::ICE_RPM, iceRPM);
+    Param::SetInt(Param::MG1_Speed, mg1_speed);
+    Param::SetInt(Param::MG2_Speed, mg2_speed);
+
+    // Manage ICE start/stop based on drive mode
+    if (driveMode != DRV_EV_ONLY && Param::GetInt(Param::opmode) == MOD_RUN)
+    {
+        bool wantsICE = (driveMode == DRV_HYBRID_SERIES ||
+                         driveMode == DRV_HYBRID_SPLIT ||
+                         driveMode == DRV_CHARGE_HOLD);
+
+        if (wantsICE && iceState.GetState() == ICEState::ICE_OFF)
+        {
+            iceState.RequestStart();
+        }
+        else if (!wantsICE && iceState.IsRunning())
+        {
+            iceState.RequestStop();
+        }
+    }
+    else if (Param::GetInt(Param::opmode) != MOD_RUN)
+    {
+        if (iceState.GetState() != ICEState::ICE_OFF)
+        {
+            iceState.RequestStop();
+        }
+    }
+
+    // Publish drive mode feedback
+    if (iceState.IsRunning())
+    {
+        Param::SetInt(Param::DriveModeFB, driveMode);
+    }
+    else
+    {
+        Param::SetInt(Param::DriveModeFB, DRV_EV_ONLY);
+    }
+
+    // Enforce MG1 overspeed protection when ICE is not running
+    if (!iceState.IsRunning())
+    {
+        EnforceMG1SpeedLimit();
+    }
+}
+
+int16_t GS450HClass::CalcICE_RPM()
+{
+    // Willis equation: ICE_RPM = (Sun * MG1 + Ring * MG2) / (Sun + Ring)
+    int32_t iceRPM = ((int32_t)sunTeeth * mg1_speed + (int32_t)ringTeeth * mg2_speed) /
+                     (sunTeeth + ringTeeth);
+    return (int16_t)iceRPM;
+}
+
+void GS450HClass::EnforceMG1SpeedLimit()
+{
+    // In EV-Free mode (ICE not locked), MG1 spins backward:
+    //   MG1_speed = -(Ring/Sun) * MG2_speed
+    // At high MG2 speeds, MG1 can overspeed.
+    // Soft limit at 6500 RPM, hard cutoff at 10000 RPM.
+    int16_t absMG1 = ABS(mg1_speed);
+
+    if (absMG1 > 10000)
+    {
+        // Hard cutoff — zero both motors
+        mg1_torque = 0;
+        mg2_torque = 0;
+    }
+    else if (absMG1 > 6500)
+    {
+        // Progressive derate: linearly reduce torque from 100% at 6500 to 0% at 10000
+        float derate = 1.0f - ((float)(absMG1 - 6500) / 3500.0f);
+        mg2_torque = (int16_t)(mg2_torque * derate);
+    }
+}
+
+void GS450HClass::SetTorqueHybrid(float torquePercent)
+{
+    int driveMode = Param::GetInt(Param::DriveMode);
+    float hybridDerate = Param::GetFloat(Param::HybridDerate) / 100.0f;
+
+    if (DriveType == GS450H)
+    {
+        GS450Hgear(); // still need gear management
+    }
+
+    switch (driveMode)
+    {
+    case DRV_EV_AWD:
+        // EV-Free mode: MG2 provides traction, MG1 freewheels
+        // ICE shaft is free-spinning (not locked)
+        scaledTorqueTarget = (torquePercent * 3500) / 100.0f;
+        mg2_torque = scaledTorqueTarget;
+        mg1_torque = 0; // let MG1 freewheel
+        break;
+
+    case DRV_HYBRID_SERIES:
+        if (iceState.IsRunning())
+        {
+            // MG1 generates at configured load level
+            mg1_torque = (int16_t)(hybridDerate * 4375);
+            // MG2 provides traction per driver request
+            scaledTorqueTarget = (torquePercent * 3500) / 100.0f;
+            mg2_torque = scaledTorqueTarget;
+        }
+        else if (iceState.IsCranking())
+        {
+            CrankICE();
+        }
+        else
+        {
+            // Fallback to EV-Free
+            scaledTorqueTarget = (torquePercent * 3500) / 100.0f;
+            mg2_torque = scaledTorqueTarget;
+            mg1_torque = 0;
+        }
+        break;
+
+    case DRV_HYBRID_SPLIT:
+        if (iceState.IsRunning())
+        {
+            // Power-split mode: MG1 provides reaction torque for ICE
+            // MG1 generating torque = ICE_contribution * (Sun / (Sun + Ring))
+            // We set MG1 to generating at configured level
+            mg1_torque = (int16_t)(hybridDerate * 4375);
+            // MG2 fills driver request
+            scaledTorqueTarget = (torquePercent * 3500) / 100.0f;
+            mg2_torque = scaledTorqueTarget;
+
+            // Estimate ICE torque contribution from MG1 reaction
+            float planetarySum = (float)(sunTeeth + ringTeeth);
+            float iceTorqEst = (mg1_torque * planetarySum) / (float)sunTeeth;
+            Param::SetFloat(Param::ICE_TorqEst, (iceTorqEst / 4375.0f) * 100.0f);
+        }
+        else if (iceState.IsCranking())
+        {
+            CrankICE();
+        }
+        else
+        {
+            scaledTorqueTarget = (torquePercent * 3500) / 100.0f;
+            mg2_torque = scaledTorqueTarget;
+            mg1_torque = 0;
+        }
+        break;
+
+    case DRV_CHARGE_HOLD:
+        if (iceState.IsRunning())
+        {
+            // Max generation from MG1
+            mg1_torque = (int16_t)(hybridDerate * 4375);
+            // Minimal MG2 traction
+            scaledTorqueTarget = (torquePercent * 3500 * 0.5f) / 100.0f;
+            mg2_torque = scaledTorqueTarget;
+        }
+        else if (iceState.IsCranking())
+        {
+            CrankICE();
+        }
+        else
+        {
+            scaledTorqueTarget = (torquePercent * 3500) / 100.0f;
+            mg2_torque = scaledTorqueTarget;
+            mg1_torque = 0;
+        }
+        break;
+
+    default:
+        // Fallback to EV-only behavior
+        scaledTorqueTarget = (torquePercent * 3500) / 100.0f;
+        mg2_torque = scaledTorqueTarget;
+        mg1_torque = (int16_t)((torquePercent * 4375) / 100.0f);
+        break;
+    }
+}
+
+void GS450HClass::CrankICE()
+{
+    // Use MG1 to crank the ICE via planetary gear.
+    // MG1 positive internal torque -> after negation in htm_data[5] -> motors MG1
+    // in the direction that spins the planet carrier (cranks ICE).
+    float crankTorquePct = Param::GetFloat(Param::ICE_CrkTrq);
+
+    // MG1 cranking torque: positive value motors MG1 forward (cranking direction)
+    mg1_torque = (int16_t)((crankTorquePct * 4375) / 100.0f);
+
+    // Hold MG2 at zero or slight brake to prevent vehicle movement during crank
+    mg2_torque = 0;
+    scaledTorqueTarget = 0;
+}
+
 //////////////////////////////////////////////////////////////
 
 

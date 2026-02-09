@@ -98,6 +98,7 @@
 #include "VWheater.h"
 #include "ElconCharger.h"
 #include "rearoutlanderinverter.h"
+#include "outlanderphev.h"
 #include "NoVehicle.h"
 #include "V_Classic.h"
 #include "kangoobms.h"
@@ -193,6 +194,7 @@ static DCDC* selectedDCDC = &DCDCnone;
 static Can_OBD2 canOBD2;
 static Shifter shifterNone;
 static RearOutlanderInverter rearoutlanderInv;
+static OutlanderPHEV outlanderPHEV;
 static LinBus* lin;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -769,6 +771,10 @@ static void UpdateInv()
         selectedInverter = &rearoutlanderInv;
         OutlanderCAN = true;
         break;
+    case InvModes::OutlanderPHEV_Mode:
+        selectedInverter = &outlanderPHEV;
+        OutlanderCAN = true;
+        break;
     }
     //This will call SetCanFilters() via the Clear Callback
     canInterface[0]->ClearUserMessages();
@@ -1000,6 +1006,12 @@ static void SetCanFilters()
     CanHardware* heater_can = canInterface[Param::GetInt(Param::HeaterCan)];
 
     selectedInverter->SetCanInterface(inverter_can);
+    // For OutlanderPHEV, assign rear motor to the opposite CAN bus
+    if (Param::GetInt(Param::Inverter) == InvModes::OutlanderPHEV_Mode)
+    {
+        CanHardware* rear_can = (Param::GetInt(Param::InverterCan) == 0) ? canInterface[1] : canInterface[0];
+        outlanderPHEV.SetSecondCanInterface(rear_can);
+    }
     selectedVehicle->SetCanInterface(vehicle_can);
     selectedCharger->SetCanInterface(charger_can);
     selectedChargeInt->SetCanInterface(lim_can);
